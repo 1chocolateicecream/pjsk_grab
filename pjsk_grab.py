@@ -42,6 +42,30 @@ UA = {"User-Agent": "pjsk-grab/2.0 (translation helper)"}
 # внутренние статусы (не трогать, на них завязаны значки)
 HAVE, NEW, PENDING, FAIL = "have", "new", "pending", "fail"
 
+# помечать вокалойдов юнитом и русским именем (для ворлд линка незаменимо).
+# выключается флагом --no-units (тогда имя остаётся как в игре, японское)
+ANNOTATE_UNITS = True
+# код юнита из character2ds.json → префикс перед именем («ориг» = piapro без метки)
+UNIT_PREFIX = {
+    "light_sound": "L/n",
+    "idol": "MMJ",
+    "street": "VBS",
+    "theme_park": "WxS",
+    "school_refusal": "N25",
+    "piapro": "",          # оригинал/виртуал сингер — без префикса
+}
+# characterId → русское имя (подставляется только когда говорит ровно этот персонаж,
+# а не «<имя>の声» / «？？？»). править имена можно прямо тут
+CHAR_RU = {
+    1: "Ичика", 2: "Саки", 3: "Хонами", 4: "Шихо",          # Leo/need
+    5: "Минори", 6: "Харука", 7: "Айри", 8: "Шизуку",       # MORE MORE JUMP!
+    9: "Кохане", 10: "Ан", 11: "Акито", 12: "Тойя",          # Vivid BAD SQUAD
+    13: "Цукаса", 14: "Эму", 15: "Нене", 16: "Руи",          # Wonderlands×Showtime
+    17: "Канаде", 18: "Мафую", 19: "Эна", 20: "Мизуки",      # 25-ji/Nightcord
+    21: "Мику", 22: "Рин", 23: "Лен",                        # Virtual Singers
+    24: "Лука", 25: "Мейко", 26: "Кайто",
+}
+
 
 # ---------------------------------------------------------------------------
 # сеть и мастер-данные
@@ -73,7 +97,9 @@ def fetch(url, retries=3):
 def _atomic_write(dest, data):
     """пишем через временный файл + переименование: либо целый файл, либо ничего
     это чтобы не остался обрезанный огрызок, если оборвётся на середине"""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    d = os.path.dirname(dest)
+    if d:
+        os.makedirs(d, exist_ok=True)
     tmp = f"{dest}.{os.getpid()}.tmp"
     try:
         with open(tmp, "wb") as f:
@@ -180,26 +206,88 @@ def _caption_from_effect(se_entry):
     return None                                   # имя ассета - мимо
 
 
+_c2d_map = None     # кэш character2ds: id → запись
+_name_map = None    # кэш: японское имя (givenName) → (characterId, русское имя)
+
+
+def _name_lookup(window_name):
+    """японское имя говорящего → (characterId, русское имя), если это ровно имя персонажа.
+    «一歌» → (1, «Ичика»); «一歌の声», «？？？» → None (не подставляем)"""
+    global _name_map
+    if _name_map is None:
+        _name_map = {}
+        for c in master("gameCharacters.json"):
+            ru = CHAR_RU.get(c["id"])
+            if ru and c.get("givenName"):
+                _name_map[c["givenName"]] = (c["id"], ru)
+    return _name_map.get(window_name)
+
+
+def _unit_prefix(talk_characters):
+    """префикс юнита для вокалойда («L/n», «MMJ», … ; оригинал → «»). иначе «»"""
+    if not talk_characters or len(talk_characters) != 1:
+        return ""
+    global _c2d_map
+    if _c2d_map is None:
+        _c2d_map = {x["id"]: x for x in master("character2ds.json")}
+    x = _c2d_map.get(talk_characters[0].get("Character2dId"))
+    return UNIT_PREFIX.get(x.get("unit"), "") if x else ""
+
+
+def _speaker_name(window_name, talk_characters):
+    """итоговое имя говорящего для .txt. русифицируем только при точном совпадении;
+    вокалойдам ещё клеим юнит-префикс. если выключено (--no-units), то имя как в игре"""
+    if not ANNOTATE_UNITS:
+        return window_name
+    hit = _name_lookup(window_name)
+    if not hit:
+        return window_name               # «<имя>の声», «？？？», прозвища — не трогаем
+    cid, ru = hit
+    if 21 <= cid <= 26:                   # вокалойд → приписываем юнит
+        prefix = _unit_prefix(talk_characters)
+        return f"{prefix} {ru}" if prefix else ru
+    return ru
+
+
 def scenario_lines(asset_json):
     """сценарий (.asset) → [(имя, реплика), ...] в правильном порядке
 
     идём по Snippets (это порядок показа в игре) и склеиваем:
         Action 1 → реплика из TalkData (имя + текст);
-    Action 6 → спецэффект из SpecialEffectData - локации ［…］, выборы 【выбор】,
-                    закадровый монолог 〈…〉. английские телопы тоже ловятся
+    Action 6 → спецэффект из SpecialEffectData - лок: ［…］, выборы 【выбор】,
+                    монолог 〈…〉, флешбеки 【флешбэк ↓/↑】. англ. телопы тоже ловятся
+    вокалойдов переименовываем с юнитом: «L/n Рин», «MMJ Лен», оригинал просто «Мику»
     """
     talk = asset_json.get("TalkData", [])
     se = asset_json.get("SpecialEffectData", [])
     out = []
+    fb_open = None          # индекс маркера «флешбэк ↓» в out, пока флешбек открыт
+    fb_had_text = False     # были ли реплики внутри флешбека (иначе он «пустой»)
     for sn in asset_json.get("Snippets", []):
         action, ref = sn.get("Action"), sn.get("ReferenceIndex", 0)
         if action == 1 and ref < len(talk):
             t = talk[ref]
-            out.append((t.get("WindowDisplayName", ""), t.get("Body", "")))
+            name = _speaker_name(
+                t.get("WindowDisplayName", ""), t.get("TalkCharacters"))
+            out.append((name, t.get("Body", "")))
+            if fb_open is not None:
+                fb_had_text = True
         elif action == 6 and ref < len(se):
-            cap = _caption_from_effect(se[ref])
-            if cap:
-                out.append((None, cap))
+            et = se[ref].get("EffectType")
+            if et == 9:                  # начало флешбека
+                fb_open, fb_had_text = len(out), False
+                out.append((None, "【флешбэк ↓】"))
+            elif et == 10:               # конец флешбека
+                if fb_open is not None:
+                    if fb_had_text:      # внутри был текст → ставим и закрывашку
+                        out.append((None, "【конец флешбэка ↑】"))
+                    else:                # пустой (просто картинка) → убираем открывашку
+                        del out[fb_open]
+                    fb_open = None
+            else:
+                cap = _caption_from_effect(se[ref])
+                if cap:
+                    out.append((None, cap))
     # подстраховка: если Snippets вдруг пустые - отдаём хотя бы реплики
     if not out:
         out = [(t.get("WindowDisplayName", ""), t.get("Body", ""))
@@ -208,11 +296,20 @@ def scenario_lines(asset_json):
 
 
 def playable_lines(playable_json):
-    """афтерлайв (.playable) → [(кто говорит, реплика), ...] по порядку"""
+    """афтерлайв (.playable) → [(кто говорит, реплика), ...] по порядку.
+    имена тоже русифицируем (юнит тут не приписать — в таймлайне нет инфы о юните)"""
     events = playable_json.get("__timelineParse", {}).get("events", [])
     talk = [e for e in events if e.get("type") == "talk" and e.get("serif")]
     talk.sort(key=lambda e: e.get("start", 0))
-    return [(e.get("character", ""), e.get("serif", "")) for e in talk]
+    out = []
+    for e in talk:
+        nm = e.get("character", "")
+        if ANNOTATE_UNITS:
+            hit = _name_lookup(nm)
+            if hit:
+                nm = hit[1]
+        out.append((nm, e.get("serif", "")))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +403,23 @@ class Run:
         parts = []
         if header:
             parts.append(f"# {header}\n\n")
+        prev = None        # имя предыдущего говорящего (для склейки подряд идущих реплик)
         for name, body in lines:
             name, body = (name or "").strip(), _one_line(body)
-            parts.append(f"{name}: {body}\n" if name else f"{body}\n")
+            if not name:
+                # подпись/маркер (локация, флешбэк, монолог) — сбрасывает склейку
+                parts.append(f"{body}\n")
+                prev = None
+            elif "？？？" in name:
+                # загадочный голос: не склеиваем (это могут быть разные люди)
+                parts.append(f"{name}: {body}\n")
+                prev = None
+            elif name == prev:
+                # тот же говорящий подряд → имя не повторяем, только реплику
+                parts.append(f"{body}\n")
+            else:
+                parts.append(f"{name}: {body}\n")
+                prev = name
         _atomic_write(dest, "".join(parts).encode("utf-8"))
 
     def mirror_new(self):
@@ -737,6 +848,8 @@ def main():
     p = argparse.ArgumentParser(
         description="тырим свежий контент из Project Sekai (JP) "
                     "без аргументов, качает самый свежий ивент")
+    p.add_argument("--no-units", action="store_true",
+                    help="оставить имена как в игре (японские, без перевода и юнит-префиксов)")
     sub = p.add_subparsers(dest="cmd")
     pe = sub.add_parser("event", help="ивент по id")
     pe.add_argument("id", type=int)
@@ -762,6 +875,9 @@ def main():
     pl.add_argument("query", nargs="?", default="")
 
     a = p.parse_args()
+    if a.no_units:
+        global ANNOTATE_UNITS
+        ANNOTATE_UNITS = False
     if a.cmd is None:
         cmd_daily()
     elif a.cmd == "event":

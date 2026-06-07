@@ -42,10 +42,13 @@ UA = {"User-Agent": "pjsk-grab/2.0 (translation helper)"}
 # внутренние статусы (не трогать, на них завязаны значки)
 HAVE, NEW, PENDING, FAIL = "have", "new", "pending", "fail"
 
-# помечать вокалойдов юнитом и русским именем (для ворлд линка незаменимо).
-# выключается флагом --no-units (тогда имя остаётся как в игре, японское)
-ANNOTATE_UNITS = True
-# код юнита из character2ds.json → префикс перед именем («ориг» = piapro без метки)
+# переводить имена говорящих на русский — ДЕФОЛТ (выключается флагом --jp)
+TRANSLATE_NAMES = True
+# приписывать вокалойдам юнит («L/n Рин») — ТОЛЬКО по флагу --units.
+# по умолчанию НЕ приписываем: в обычном (одно-юнитовом) ивенте это лишний шум,
+# а вот в ворлд линке / микс-ивентах, где воки из разных юнитов, включай --units
+ADD_UNITS = False
+# код юнита из character2ds.json → префикс перед именем (piapro/оригинал — без метки)
 UNIT_PREFIX = {
     "light_sound": "L/n",
     "idol": "MMJ",
@@ -235,15 +238,15 @@ def _unit_prefix(talk_characters):
 
 
 def _speaker_name(window_name, talk_characters):
-    """итоговое имя говорящего для .txt. русифицируем только при точном совпадении;
-    вокалойдам ещё клеим юнит-префикс. если выключено (--no-units), то имя как в игре"""
-    if not ANNOTATE_UNITS:
+    """итоговое имя говорящего для .txt. русифицируем только при точном совпадении.
+    юнит-префикс вокалойду клеим ТОЛЬКО если включён --units. с --jp — имя как в игре."""
+    if not TRANSLATE_NAMES:
         return window_name
     hit = _name_lookup(window_name)
     if not hit:
         return window_name               # «<имя>の声», «？？？», прозвища — не трогаем
     cid, ru = hit
-    if 21 <= cid <= 26:                   # вокалойд → приписываем юнит
+    if ADD_UNITS and 21 <= cid <= 26:     # вокалойд + флаг --units → приписываем юнит
         prefix = _unit_prefix(talk_characters)
         return f"{prefix} {ru}" if prefix else ru
     return ru
@@ -256,7 +259,7 @@ def scenario_lines(asset_json):
         Action 1 → реплика из TalkData (имя + текст);
     Action 6 → спецэффект из SpecialEffectData - лок: ［…］, выборы 【выбор】,
                     монолог 〈…〉, флешбеки 【флешбэк ↓/↑】. англ. телопы тоже ловятся
-    вокалойдов переименовываем с юнитом: «L/n Рин», «MMJ Лен», оригинал просто «Мику»
+    имена переводим на русский; вокалойдам юнит клеим только с флагом --units
     """
     talk = asset_json.get("TalkData", [])
     se = asset_json.get("SpecialEffectData", [])
@@ -304,7 +307,7 @@ def playable_lines(playable_json):
     out = []
     for e in talk:
         nm = e.get("character", "")
-        if ANNOTATE_UNITS:
+        if TRANSLATE_NAMES:
             hit = _name_lookup(nm)
             if hit:
                 nm = hit[1]
@@ -721,6 +724,44 @@ def cmd_event(event_id):
             + (f";  свежак: {out}" if out else ""))
 
 
+def cmd_episode(event_id, episode_no):
+    """только одна глава ивента, и ничего больше (ни картинок, ни остального)"""
+    ev = next((e for e in master("events.json") if e["id"] == event_id), None)
+    if not ev:
+        sys.exit(f"нет такого ивента с id={event_id} :(")
+    story = next((s for s in master("eventStories.json")
+                    if s["eventId"] == event_id), None)
+    if not story:
+        sys.exit(f"у ивента {event_id} вообще нет истории :(")
+    ep = next((e for e in story["eventStoryEpisodes"]
+                if e["episodeNo"] == episode_no), None)
+    if not ep:
+        have = ", ".join(str(e["episodeNo"])
+                            for e in story["eventStoryEpisodes"])
+        sys.exit(f"в ивенте {event_id} нет главы {episode_no} (есть: {have})")
+
+    folder = os.path.join(ARCHIVE, "Ивенты", safe(f"{event_id} - {ev['name']}"))
+    dest = os.path.join(folder, "Истории", f"{safe(ep['scenarioId'])}.txt")
+    url = (f"{ASSET_BASE}/event_story/{story['assetbundleName']}"
+            f"/scenario/{ep['scenarioId']}.asset")
+    run = Run()
+    st = run.save_text(
+        url, dest, f"{ev['name']} - эп.{ep['episodeNo']} «{ep['title']}»")
+
+    print(f"\n═══ ивент {event_id} · {ev['name']}")
+    print(f"    глава {ep['episodeNo']} «{ep['title']}»   {MARK[st]}")
+    out = run.mirror_new()
+    if st == NEW:
+        print(f"\nскачено: {os.path.relpath(dest, ARCHIVE)}"
+                + (f";  свежак: {out}" if out else ""))
+    elif st == HAVE:
+        print("\nуже лежит в архиве (заново не качаю)")
+    elif st == PENDING:
+        print("\nэтой главы ещё нет на серваке")
+    else:
+        print("\nне получилось скачать :(")
+
+
 def cmd_card(card_id):
     run = Run()
     process_card(card_id, run)
@@ -848,11 +889,18 @@ def main():
     p = argparse.ArgumentParser(
         description="тырим свежий контент из Project Sekai (JP) "
                     "без аргументов, качает самый свежий ивент")
-    p.add_argument("--no-units", action="store_true",
-                    help="оставить имена как в игре (японские, без перевода и юнит-префиксов)")
+    p.add_argument("--units", action="store_true",
+                    help="приписывать вокалойдам юнит «L/n Рин» (для ворлд линка / микс-ивентов)")
+    p.add_argument("--jp", action="store_true",
+                    help="оставить имена японскими, без перевода")
     sub = p.add_subparsers(dest="cmd")
     pe = sub.add_parser("event", help="ивент по id")
     pe.add_argument("id", type=int)
+    pep = sub.add_parser(
+        "episode",
+        help="одна глава ивента: episode <id ивента> <номер главы>")
+    pep.add_argument("event_id", type=int)
+    pep.add_argument("episode_no", type=int)
     pc = sub.add_parser("card", help="карта по id")
     pc.add_argument("id", type=int)
     pa = sub.add_parser("afterlive", help="афтерлайв по id virtual live")
@@ -875,13 +923,18 @@ def main():
     pl.add_argument("query", nargs="?", default="")
 
     a = p.parse_args()
-    if a.no_units:
-        global ANNOTATE_UNITS
-        ANNOTATE_UNITS = False
+    if a.units:
+        global ADD_UNITS
+        ADD_UNITS = True
+    if a.jp:
+        global TRANSLATE_NAMES
+        TRANSLATE_NAMES = False
     if a.cmd is None:
         cmd_daily()
     elif a.cmd == "event":
         cmd_event(a.id)
+    elif a.cmd == "episode":
+        cmd_episode(a.event_id, a.episode_no)
     elif a.cmd == "card":
         cmd_card(a.id)
     elif a.cmd == "afterlive":
